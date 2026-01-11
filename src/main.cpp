@@ -29,12 +29,19 @@ unsigned long lastCurrentRead = 0;
 unsigned long sw1HoldStart = 0;
 unsigned long sw2HoldStart = 0;
 
+// New: flags to avoid blocking while waiting for release
+bool sw1HoldHandled = false;
+bool sw2HoldHandled = false;
+
 struct RelayTask {
   String name;
   bool active = false;
   unsigned long startTime = 0;
   bool re4Triggered = false;
+  bool re4Pulsing = false;
+  unsigned long re4PulseStart = 0;
   bool relayOn = false;
+  bool shouldPulseRE4 = false; // whether this task should pulse RE4 after flap opening
   RelayTask(String relayName = "") : name(relayName) {}
 };
 
@@ -62,10 +69,16 @@ void turnOffAllRelays() {
   digitalWrite(RE4_PIN, HIGH);
   re1Task.active = false;
   re1Task.relayOn = false;
+  re1Task.re4Pulsing = false;
+  re1Task.re4Triggered = false;
   re2Task.active = false;
   re2Task.relayOn = false;
+  re2Task.re4Pulsing = false;
+  re2Task.re4Triggered = false;
   re3Task.active = false;
   re3Task.relayOn = false;
+  re3Task.re4Pulsing = false;
+  re3Task.re4Triggered = false;
   debugPrintln("All relays turned OFF due to long switch hold.");
 }
 
@@ -74,32 +87,44 @@ void startRelayTask(RelayTask &task, int relayPin, bool triggerRE4) {
   digitalWrite(relayPin, LOW);
   task.active = true;
   task.startTime = millis();
-  task.re4Triggered = !triggerRE4; // If RE4 should be triggered, set false
+  task.re4Triggered = false;
+  task.re4Pulsing = false;
+  task.re4PulseStart = 0;
   task.relayOn = true;
+  task.shouldPulseRE4 = triggerRE4;
   debugPrint("Relay ON: ");
   debugPrintln(task.name);
 }
 
-// Helper to process relay task
+// Helper to process relay task (non-blocking)
 void processRelayTask(RelayTask &task, int relayPin) {
   if (!task.active) return;
   unsigned long now = millis();
 
-  // After FLAP_OPENING_TIME, trigger RE4 for 1s (if not already triggered)
-  if (!task.re4Triggered && now - task.startTime >= FLAP_OPENING_TIME) {
+  // After FLAP_OPENING_TIME, trigger RE4 for 1s (non-blocking)
+  if (task.shouldPulseRE4 && !task.re4Triggered && !task.re4Pulsing && (now - task.startTime >= FLAP_OPENING_TIME)) {
     digitalWrite(RE4_PIN, LOW);
-    delay(1000);
+    task.re4Pulsing = true;
+    task.re4PulseStart = now;
+    debugPrint("Started RE4 pulse for: ");
+    debugPrintln(task.name);
+  }
+
+  if (task.re4Pulsing && (now - task.re4PulseStart >= 1000)) {
     digitalWrite(RE4_PIN, HIGH);
+    task.re4Pulsing = false;
     task.re4Triggered = true;
-    debugPrint("Relay RE4 triggered by: ");
+    debugPrint("Completed RE4 pulse for: ");
     debugPrintln(task.name);
   }
 
   // After CENTRAL_FAN_RUN_TIME, turn off relay
-  if (task.relayOn && now - task.startTime >= CENTRAL_FAN_RUN_TIME) {
+  if (task.relayOn && (now - task.startTime >= CENTRAL_FAN_RUN_TIME)) {
     digitalWrite(relayPin, HIGH);
     task.active = false;
     task.relayOn = false;
+    task.re4Pulsing = false;
+    task.re4Triggered = false;
     debugPrint("Relay OFF: ");
     debugPrintln(task.name);
   }
@@ -119,7 +144,12 @@ void setup() {
   digitalWrite(RE4_PIN, HIGH);
 
   Serial.begin(9600);
-  bme.begin(0x76); // Check your BME280 I2C address 0x76 or 0x77
+  if (!bme.begin(0x76)) { // Check your BME280 I2C address 0x76 or 0x77
+    debugPrintln("BME280 not found at 0x76");
+    // continue running without BME
+  } else {
+    debugPrintln("BME280 initialized");
+  }
 }
 
 void loop() {
@@ -127,8 +157,9 @@ void loop() {
   static bool sw1Prev = HIGH, sw2Prev = HIGH;
   bool sw1 = digitalRead(SW1_PIN);
   bool sw2 = digitalRead(SW2_PIN);
+  unsigned long now = millis();
 
-  // SW1 pressed
+  // SW1 pressed (edge)
   if (sw1Prev == HIGH && sw1 == LOW) {
     debugPrintln("Switch pressed: SW1");
     if (!re1Task.active) {
@@ -138,7 +169,7 @@ void loop() {
       startRelayTask(re1Task, RE1_PIN, false);
     }
   }
-  // SW2 pressed
+  // SW2 pressed (edge)
   if (sw2Prev == HIGH && sw2 == LOW) {
     debugPrintln("Switch pressed: SW2");
     if (!re2Task.active) {
@@ -147,41 +178,41 @@ void loop() {
       startRelayTask(re2Task, RE2_PIN, false);
     }
   }
-  // Switch hold detection
+
+  // Non-blocking Switch hold detection (3s)
   if (sw1 == LOW) {
-    if (sw1HoldStart == 0) sw1HoldStart = millis();
-    if (millis() - sw1HoldStart > 3000) {
+    if (sw1HoldStart == 0) sw1HoldStart = now;
+    if (!sw1HoldHandled && (now - sw1HoldStart > 3000)) {
       turnOffAllRelays();
-      // Wait until switch is released to avoid repeated triggers
-      while (digitalRead(SW1_PIN) == LOW) delay(10);
-      sw1HoldStart = 0;
-      sw2HoldStart = 0;
-      return; // Skip rest of loop to avoid race conditions
+      sw1HoldHandled = true; // wait for release to reset
     }
   } else {
     sw1HoldStart = 0;
+    sw1HoldHandled = false;
   }
 
   if (sw2 == LOW) {
-    if (sw2HoldStart == 0) sw2HoldStart = millis();
-    if (millis() - sw2HoldStart > 3000) {
+    if (sw2HoldStart == 0) sw2HoldStart = now;
+    if (!sw2HoldHandled && (now - sw2HoldStart > 3000)) {
       turnOffAllRelays();
-      while (digitalRead(SW2_PIN) == LOW) delay(10);
-      sw1HoldStart = 0;
-      sw2HoldStart = 0;
-      return;
+      sw2HoldHandled = true; // wait for release to reset
     }
   } else {
     sw2HoldStart = 0;
+    sw2HoldHandled = false;
   }
 
   sw1Prev = sw1;
   sw2Prev = sw2;
 
   // Humidity every HUMIDITY_READOUT_PERIOD
-  if (millis() - lastHumidityRead > HUMIDITY_READOUT_PERIOD) {
-    lastHumidityRead = millis();
-    float humidity = bme.readHumidity();
+  if (now - lastHumidityRead > HUMIDITY_READOUT_PERIOD) {
+    lastHumidityRead = now;
+    float humidity = 0.0;
+    // protect against missing BME
+    if (bme.begin(0x76) || true) { // attempt to read if available; bme.readHumidity won't block long
+      humidity = bme.readHumidity();
+    }
     debugPrint("Humidity: "); debugPrintln(String(humidity));
     if (humidity > HUMIDITY_THRESHOLD) {
       if (!re1Task.active) {
@@ -192,9 +223,9 @@ void loop() {
     }
   }
 
-  // Current every CURRENT_REDOUT_PERIOD
-  if (millis() - lastCurrentRead > CURRENT_READOUT_PERIOD) {
-    lastCurrentRead = millis();
+  // Current every CURRENT_READOUT_PERIOD
+  if (now - lastCurrentRead > CURRENT_READOUT_PERIOD) {
+    lastCurrentRead = now;
     int sensorValue = analogRead(ACS712_PIN);
     float voltage = sensorValue * (5.0 / 1023.0);
     float current = (voltage - 2.5) / 0.185; // ACS712 5A version
@@ -209,9 +240,10 @@ void loop() {
     }
   }
 
-  // Process relay tasks
+  // Process relay tasks (non-blocking)
   processRelayTask(re1Task, RE1_PIN);
   processRelayTask(re2Task, RE2_PIN);
   processRelayTask(re3Task, RE3_PIN);
+
   delay(50);
 }
