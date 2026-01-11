@@ -15,6 +15,7 @@
 
 #define FLAP_OPENING_TIME 5000
 #define CENTRAL_FAN_RUN_TIME 120000
+#define CENTRAL_FAN_WAIT_TIME 10000
 #define HUMIDITY_READOUT_PERIOD 10000
 #define CURRENT_READOUT_PERIOD 5000
 #define HUMIDITY_THRESHOLD 70.0
@@ -41,13 +42,20 @@ struct RelayTask {
   bool re4Pulsing = false;
   unsigned long re4PulseStart = 0;
   bool relayOn = false;
-  bool shouldPulseRE4 = false; // whether this task should pulse RE4 after flap opening
+  bool shouldPulseRE4 = false; // initial flap pulse after FLAP_OPENING_TIME
+  uint8_t pendingRE4 = 0;      // queued pulses requested while active
+  unsigned long nextPulseTime = 0; // next scheduled RE4 pulse time (non-zero means scheduled)
+  bool autoOff = true;        // if true, auto-turn-off after CENTRAL_FAN_RUN_TIME; re3 will set false
   RelayTask(String relayName = "") : name(relayName) {}
 };
 
 RelayTask re1Task("RE1");
 RelayTask re2Task("RE2");
 RelayTask re3Task("RE3");
+
+// Global RE4 ownership to avoid overlapping pulses
+RelayTask* re4Owner = nullptr;
+unsigned long re4PulseStartGlobal = 0;
 
 // Debug print functions
 void debugPrint(const String &msg) {
@@ -71,14 +79,20 @@ void turnOffAllRelays() {
   re1Task.relayOn = false;
   re1Task.re4Pulsing = false;
   re1Task.re4Triggered = false;
+  re1Task.pendingRE4 = 0;
+  re1Task.nextPulseTime = 0;
   re2Task.active = false;
   re2Task.relayOn = false;
   re2Task.re4Pulsing = false;
   re2Task.re4Triggered = false;
+  re2Task.pendingRE4 = 0;
+  re2Task.nextPulseTime = 0;
   re3Task.active = false;
   re3Task.relayOn = false;
   re3Task.re4Pulsing = false;
   re3Task.re4Triggered = false;
+  re3Task.pendingRE4 = 0;
+  re3Task.nextPulseTime = 0;
   debugPrintln("All relays turned OFF due to long switch hold.");
 }
 
@@ -92,7 +106,23 @@ void startRelayTask(RelayTask &task, int relayPin, bool triggerRE4) {
   task.re4PulseStart = 0;
   task.relayOn = true;
   task.shouldPulseRE4 = triggerRE4;
+  // if initial trigger requested, clear queued pulses and schedule periodic pulses if needed
+  if (triggerRE4) {
+    task.pendingRE4 = 0;
+    task.nextPulseTime = 0; // will be set later as needed by processRelayTask
+  }
   debugPrint("Relay ON: ");
+  debugPrintln(task.name);
+}
+
+// Start a RE4 pulse for given task if RE4 is free
+void beginRE4PulseFor(RelayTask &task, unsigned long now) {
+  if (re4Owner != nullptr) return; // busy, will be retried later
+  digitalWrite(RE4_PIN, LOW);
+  re4Owner = &task;
+  re4Owner->re4Pulsing = true;
+  re4PulseStartGlobal = now;
+  debugPrint("Started RE4 pulse for: ");
   debugPrintln(task.name);
 }
 
@@ -101,30 +131,50 @@ void processRelayTask(RelayTask &task, int relayPin) {
   if (!task.active) return;
   unsigned long now = millis();
 
-  // After FLAP_OPENING_TIME, trigger RE4 for 1s (non-blocking)
+  // Initial flap pulse after FLAP_OPENING_TIME
   if (task.shouldPulseRE4 && !task.re4Triggered && !task.re4Pulsing && (now - task.startTime >= FLAP_OPENING_TIME)) {
-    digitalWrite(RE4_PIN, LOW);
-    task.re4Pulsing = true;
-    task.re4PulseStart = now;
-    debugPrint("Started RE4 pulse for: ");
-    debugPrintln(task.name);
+    beginRE4PulseFor(task, now);
   }
 
-  if (task.re4Pulsing && (now - task.re4PulseStart >= 1000)) {
+  // Periodic or queued pulses:
+  // - For re3 (autoOff == false) pulse periodically every CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME while active.
+  // - For re1/re2, if user pressed while active, pendingRE4 holds number of extra pulses to run starting at startTime + CENTRAL_FAN_RUN_TIME + WAIT.
+  if (task.nextPulseTime != 0 && now >= task.nextPulseTime) {
+    // schedule a pulse (if RE4 free)
+    beginRE4PulseFor(task, now);
+    if (&task == &re3Task) {
+      // schedule next periodic pulse while still active
+      task.nextPulseTime = now + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
+    } else {
+      // consume one pending request
+      if (task.pendingRE4 > 0) task.pendingRE4--;
+      if (task.pendingRE4 > 0) {
+        task.nextPulseTime = now + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
+      } else {
+        task.nextPulseTime = 0;
+      }
+    }
+  }
+
+  // If RE4 global pulse completes, finalize ownership
+  if (re4Owner != nullptr && re4Owner->re4Pulsing && (now - re4PulseStartGlobal >= 1000)) {
     digitalWrite(RE4_PIN, HIGH);
-    task.re4Pulsing = false;
-    task.re4Triggered = true;
+    re4Owner->re4Pulsing = false;
+    re4Owner->re4Triggered = true;
     debugPrint("Completed RE4 pulse for: ");
-    debugPrintln(task.name);
+    debugPrintln(re4Owner->name);
+    re4Owner = nullptr;
   }
 
-  // After CENTRAL_FAN_RUN_TIME, turn off relay
-  if (task.relayOn && (now - task.startTime >= CENTRAL_FAN_RUN_TIME)) {
+  // Auto-off only if allowed (re1/re2). re3 will be controlled by current sensor.
+  if (task.autoOff && task.relayOn && (now - task.startTime >= CENTRAL_FAN_RUN_TIME)) {
     digitalWrite(relayPin, HIGH);
     task.active = false;
     task.relayOn = false;
     task.re4Pulsing = false;
     task.re4Triggered = false;
+    task.pendingRE4 = 0;
+    task.nextPulseTime = 0;
     debugPrint("Relay OFF: ");
     debugPrintln(task.name);
   }
@@ -150,6 +200,9 @@ void setup() {
   } else {
     debugPrintln("BME280 initialized");
   }
+
+  // re3 should stay active as long as current > threshold
+  re3Task.autoOff = false;
 }
 
 void loop() {
@@ -164,9 +217,16 @@ void loop() {
     debugPrintln("Switch pressed: SW1");
     if (!re1Task.active) {
       startRelayTask(re1Task, RE1_PIN, true);
+      // schedule periodic pulse after main run finished if needed (for initial run)
+      re1Task.nextPulseTime = re1Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
     } else {
-      // If already active, just restart timer, don't trigger RE4
-      startRelayTask(re1Task, RE1_PIN, false);
+      // If already active, queue a RE4 pulse (don't restart timer)
+      re1Task.pendingRE4++;
+      if (re1Task.nextPulseTime == 0) {
+        re1Task.nextPulseTime = re1Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
+      }
+      debugPrint("Queued RE4 pulse for: ");
+      debugPrintln(re1Task.name);
     }
   }
   // SW2 pressed (edge)
@@ -174,8 +234,14 @@ void loop() {
     debugPrintln("Switch pressed: SW2");
     if (!re2Task.active) {
       startRelayTask(re2Task, RE2_PIN, true);
+      re2Task.nextPulseTime = re2Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
     } else {
-      startRelayTask(re2Task, RE2_PIN, false);
+      re2Task.pendingRE4++;
+      if (re2Task.nextPulseTime == 0) {
+        re2Task.nextPulseTime = re2Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
+      }
+      debugPrint("Queued RE4 pulse for: ");
+      debugPrintln(re2Task.name);
     }
   }
 
@@ -219,6 +285,11 @@ void loop() {
         debugPrint("Humidity triggered relay: ");
         debugPrintln(re1Task.name);
         startRelayTask(re1Task, RE1_PIN, true);
+        re1Task.nextPulseTime = re1Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
+      } else {
+        // queue an extra pulse
+        re1Task.pendingRE4++;
+        if (re1Task.nextPulseTime == 0) re1Task.nextPulseTime = re1Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
       }
     }
   }
@@ -231,11 +302,25 @@ void loop() {
     float current = (voltage - 2.5) / 0.185; // ACS712 5A version
     current = abs(current);
     debugPrint("Current: "); debugPrintln(String(current * 1000)); // mA
+
     if (current * 1000 > CURRENT_THRESHOLD) {
       if (!re3Task.active) {
         debugPrint("Current triggered relay: ");
         debugPrintln(re3Task.name);
         startRelayTask(re3Task, RE3_PIN, true);
+        // for re3 we want periodic RE4 pulses while current stays high
+        re3Task.nextPulseTime = re3Task.startTime + CENTRAL_FAN_RUN_TIME + CENTRAL_FAN_WAIT_TIME;
+      }
+      // keep relay 3 open (do not auto-off)
+    } else {
+      // current below threshold -> turn off re3 if it was active
+      if (re3Task.active) {
+        digitalWrite(RE3_PIN, HIGH);
+        re3Task.active = false;
+        re3Task.relayOn = false;
+        re3Task.pendingRE4 = 0;
+        re3Task.nextPulseTime = 0;
+        debugPrintln("Relay OFF due to current drop: RE3");
       }
     }
   }
